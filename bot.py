@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -197,12 +197,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Tägliche Tasks
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(email_question, "cron", hour=8, minute=0)
-    scheduler.add_job(daily_reminder, "cron", hour=9, minute=0)
-
-    app.scheduler = scheduler
-    scheduler.start()
+    tz = pytz.timezone("Europe/Berlin")
+    app.job_queue.run_daily(email_question, time=time(8, 0, tzinfo=tz))
+    app.job_queue.run_daily(daily_reminder, time=time(9, 0, tzinfo=tz))
 
     print("✅ Bot läuft!")
     app.run_polling()
