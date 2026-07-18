@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from datetime import datetime, timedelta, time
 from telegram import Update
@@ -183,8 +185,17 @@ Fragen? Schreib einfach eine Nachricht!
 """
     await update.message.reply_text(message, parse_mode='Markdown')
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def log_message(self, *a): pass
+                    
+def start_health_server():
+        HTTPServer(("0.0.0.0", int(os.getenv("PORT", "10000"))), HealthHandler).serve_forever()
+
 def main():
     """Starte den Bot"""
+    threading.Thread(target=start_health_server, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Commands
