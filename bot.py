@@ -28,26 +28,30 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# iCloud CalDAV (zum Eintragen + zuverlässigen Lesen)
+# iCloud CalDAV
 ICLOUD_USERNAME = os.getenv("ICLOUD_USERNAME")
 ICLOUD_APP_PASSWORD = os.getenv("ICLOUD_APP_PASSWORD")
-CALDAV_CALENDAR = os.getenv("CALDAV_CALENDAR")  # optional: Name des Zielkalenders
+CALDAV_CALENDAR = os.getenv("CALDAV_CALENDAR")
 CALDAV_URL = "https://caldav.icloud.com"
 
-# Erinnerung: wie viele Minuten vorher
+# Notion
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_NOTES_PAGE_ID = os.getenv("NOTION_NOTES_PAGE_ID")
+NOTION_TODO_PAGE_ID = os.getenv("NOTION_TODO_PAGE_ID")
+NOTION_VERSION = "2022-06-28"
+
+# Erinnerung: wie viele Minuten vor einem Termin
 REMINDER_LEAD_MIN = int(os.getenv("REMINDER_LEAD_MIN", "60"))
 
 TZ = pytz.timezone("Europe/Berlin")
 
 DATA_FILE = "user_data.json"
 
-# Gesprächsverlauf im Speicher
 conversation = []
 MAX_HISTORY = 12
 
-# Kalender-Cache
 _cal_cache = {"time": 0, "events": []}
-CAL_CACHE_SECONDS = 300  # 5 Minuten
+CAL_CACHE_SECONDS = 300
 
 _caldav_principal = None
 
@@ -56,7 +60,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"emails": [], "settings": {}, "reminded": []}
+    return {"emails": [], "settings": {}, "reminded": [], "reminders": []}
 
 
 def save_data(data):
@@ -66,7 +70,6 @@ def save_data(data):
 
 # ===== CALDAV (iCloud) =====
 def get_caldav_principal():
-    """Verbindung zu iCloud aufbauen (einmalig, gecacht)."""
     global _caldav_principal
     if _caldav_principal is not None:
         return _caldav_principal
@@ -83,7 +86,6 @@ def get_caldav_principal():
 
 
 def pick_target_calendar(principal):
-    """Wähle den Zielkalender zum Eintragen."""
     calendars = principal.calendars()
     if not calendars:
         return None
@@ -98,21 +100,18 @@ def pick_target_calendar(principal):
 
 
 def _normalize_start(dtval):
-    """Gibt (aware_datetime_or_None, all_day_bool) zurück."""
     if isinstance(dtval, datetime):
         aware = dtval if dtval.tzinfo else TZ.localize(dtval)
         return aware.astimezone(TZ), False
     if isinstance(dtval, date):
-        # Ganztägig
         return TZ.localize(datetime(dtval.year, dtval.month, dtval.day, 0, 0)), True
     return None, False
 
 
 def caldav_get_events(days=7):
-    """Termine der nächsten N Tage über CalDAV holen."""
     principal = get_caldav_principal()
     if principal is None:
-        return None  # Signal: CalDAV nicht verfügbar
+        return None
     start = datetime.now(TZ)
     end = start + timedelta(days=days)
     events = []
@@ -150,10 +149,9 @@ def caldav_get_events(days=7):
 
 
 def caldav_add_event(title, start_dt, duration_min=60):
-    """Termin in iCloud eintragen. start_dt: naive oder aware datetime (Berlin)."""
     principal = get_caldav_principal()
     if principal is None:
-        return False, "iCloud ist nicht verbunden (ICLOUD_USERNAME / ICLOUD_APP_PASSWORD fehlen)."
+        return False, "iCloud ist nicht verbunden."
     cal = pick_target_calendar(principal)
     if cal is None:
         return False, "Kein Kalender gefunden."
@@ -173,14 +171,14 @@ def caldav_add_event(title, start_dt, duration_min=60):
     c.add_component(ev)
     try:
         cal.save_event(c.to_ical().decode("utf-8"))
-        _cal_cache["time"] = 0  # Cache leeren, damit neuer Termin sichtbar wird
+        _cal_cache["time"] = 0
         return True, None
     except Exception as e:
         print(f"Termin eintragen fehlgeschlagen: {e}")
         return False, str(e)
 
 
-# ===== ICS-FALLBACK (nur lesend) =====
+# ===== ICS-FALLBACK =====
 def get_calendar_events_ics(cal_link, days=7):
     try:
         response = requests.get(cal_link, timeout=10)
@@ -212,16 +210,15 @@ def get_calendar_events_ics(cal_link, days=7):
 
 
 def get_events(days=7, force=False):
-    """Zentrale Termin-Abfrage: erst CalDAV, sonst ICS-Fallback. Mit Cache."""
     now = _time.time()
     if not force and (now - _cal_cache["time"]) < CAL_CACHE_SECONDS:
         return _cal_cache["events"]
 
     events = caldav_get_events(days=days)
-    if events is None:  # CalDAV nicht verfügbar -> ICS
+    if events is None:
         events = []
         for link in CALENDAR_LINKS:
-            if link.strip():
+            if link.strip() and link.strip().startswith("http"):
                 events.extend(get_calendar_events_ics(link, days=days))
         events.sort(key=lambda x: x["start"])
 
@@ -241,6 +238,56 @@ def format_events(events):
         else:
             lines.append(f"🕐 {d} {e['start'].strftime('%H:%M')} – {e['title']}")
     return "\n".join(lines)
+
+
+# ===== NOTION =====
+def notion_append(page_id, block):
+    if not (NOTION_TOKEN and page_id):
+        return False, "Notion ist nicht konfiguriert (Token/Seiten-ID fehlt)."
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.patch(url, headers=headers, json={"children": [block]}, timeout=15)
+        if r.status_code in (200, 201):
+            return True, None
+        return False, f"{r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def add_todo(text):
+    block = {"object": "block", "type": "to_do",
+             "to_do": {"rich_text": [{"type": "text", "text": {"content": text}}], "checked": False}}
+    return notion_append(NOTION_TODO_PAGE_ID, block)
+
+
+def add_note(text):
+    block = {"object": "block", "type": "bulleted_list_item",
+             "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]}}
+    return notion_append(NOTION_NOTES_PAGE_ID, block)
+
+
+# ===== PERSÖNLICHE ERINNERUNGEN =====
+async def send_custom_reminder(context: ContextTypes.DEFAULT_TYPE):
+    d = context.job.data
+    await context.bot.send_message(chat_id=OWNER_ID, text=f"⏰ **Erinnerung:** {d['text']}",
+                                   parse_mode='Markdown')
+    data = load_data()
+    data["reminders"] = [r for r in data.get("reminders", []) if r["id"] != d["id"]]
+    save_data(data)
+
+
+def schedule_reminder(job_queue, rid, text, when_dt):
+    if when_dt.tzinfo is None:
+        when_dt = TZ.localize(when_dt)
+    if when_dt <= datetime.now(TZ):
+        return False
+    job_queue.run_once(send_custom_reminder, when=when_dt, data={"id": rid, "text": text})
+    return True
 
 
 # ===== CLAUDE =====
@@ -266,12 +313,17 @@ def ask_claude(user_text):
         "Du antwortest kurz, freundlich und auf Deutsch.\n"
         f"Aktuelles Datum/Uhrzeit (Europe/Berlin): {heute}.\n\n"
         f"{cal_context}\n\n"
-        "WICHTIG – Termin eintragen: Wenn Marco dich bittet, einen Termin/Kalendereintrag "
-        "hinzuzufügen (z. B. 'trag mir morgen 18 Uhr Zahnarzt ein'), antworte NICHT in Prosa, "
-        "sondern gib EXAKT eine Zeile aus:\n"
-        "CREATE_EVENT {\"title\": \"...\", \"start\": \"YYYY-MM-DDTHH:MM\", \"duration_min\": 60}\n"
-        "Die Startzeit ist Lokalzeit (Berlin). Löse 'heute', 'morgen', Wochentage anhand des "
-        "aktuellen Datums auf. Wenn die Uhrzeit oder der Titel fehlt, frage stattdessen kurz nach."
+        "Wenn Marco eine AKTION will, antworte NICHT in Prosa, sondern gib EXAKT eine einzige Zeile "
+        "mit genau einem der folgenden Kommandos und JSON aus:\n"
+        "- Termin/Kalender eintragen: CREATE_EVENT {\"title\": \"...\", \"start\": \"YYYY-MM-DDTHH:MM\", \"duration_min\": 60}\n"
+        "- Todo/Aufgabe: CREATE_TODO {\"text\": \"...\"}\n"
+        "- Notiz: CREATE_NOTE {\"text\": \"...\"}\n"
+        "- Persönliche Erinnerung zu einer Uhrzeit (z. B. 'erinnere mich morgen 17 Uhr an X'): "
+        "CREATE_REMINDER {\"text\": \"...\", \"when\": \"YYYY-MM-DDTHH:MM\"}\n"
+        "Zeiten sind Lokalzeit (Berlin). Löse 'heute', 'morgen', Wochentage anhand des aktuellen Datums auf. "
+        "Unterschied: CREATE_EVENT ist ein Kalendertermin, CREATE_REMINDER ist nur eine Nachricht zur Uhrzeit. "
+        "Wenn Infos fehlen (Uhrzeit/Titel), frage stattdessen kurz nach. "
+        "Bei normalen Fragen/Gesprächen antworte einfach normal in Prosa."
     )
 
     conversation.append({"role": "user", "content": user_text})
@@ -296,27 +348,70 @@ def ask_claude(user_text):
         return f"⚠️ Fehler bei der Antwort: {e}"
 
 
-def try_handle_create_event(answer_text):
-    """Wenn Claude CREATE_EVENT ausgibt, Termin anlegen. Gibt Bestätigungstext oder None."""
-    m = re.search(r"CREATE_EVENT\s*(\{.*\})", answer_text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        payload = json.loads(m.group(1))
-        title = payload["title"]
-        start_dt = datetime.fromisoformat(payload["start"])
-        duration = int(payload.get("duration_min", 60))
-    except Exception as e:
-        return f"⚠️ Ich konnte den Termin nicht verstehen ({e}). Sag es mir bitte nochmal, z. B. 'morgen 18 Uhr Zahnarzt'."
-
-    ok, err = caldav_add_event(title, start_dt, duration)
-    if ok:
-        disp = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
-        return f"✅ Eingetragen: **{title}** am {disp.strftime('%a %d.%m. %H:%M')} Uhr."
-    return f"⚠️ Konnte den Termin nicht eintragen: {err}"
+def parse_directive(answer_text):
+    for key in ("CREATE_EVENT", "CREATE_TODO", "CREATE_NOTE", "CREATE_REMINDER"):
+        m = re.search(key + r"\s*(\{.*\})", answer_text, re.DOTALL)
+        if m:
+            try:
+                return key, json.loads(m.group(1))
+            except Exception as e:
+                return key, {"_error": str(e)}
+    return None, None
 
 
-# ===== TÄGLICHE JOBS + ERINNERUNG =====
+def execute_directive(kind, payload, context):
+    """Führt eine Aktion aus und gibt den Bestätigungstext zurück."""
+    if "_error" in payload:
+        return "⚠️ Das habe ich nicht ganz verstanden – sag es mir bitte nochmal etwas genauer."
+
+    if kind == "CREATE_EVENT":
+        try:
+            title = payload["title"]
+            start_dt = datetime.fromisoformat(payload["start"])
+            duration = int(payload.get("duration_min", 60))
+        except Exception:
+            return "⚠️ Termin unklar – z. B. 'morgen 18 Uhr Zahnarzt'."
+        ok, err = caldav_add_event(title, start_dt, duration)
+        if ok:
+            disp = TZ.localize(start_dt) if start_dt.tzinfo is None else start_dt.astimezone(TZ)
+            return f"✅ Termin eingetragen: **{title}** am {disp.strftime('%a %d.%m. %H:%M')} Uhr."
+        return f"⚠️ Konnte den Termin nicht eintragen: {err}"
+
+    if kind == "CREATE_TODO":
+        text = payload.get("text", "").strip()
+        if not text:
+            return "⚠️ Was soll das Todo sein?"
+        ok, err = add_todo(text)
+        return f"✅ Todo in Notion gespeichert: {text}" if ok else f"⚠️ Konnte das Todo nicht speichern: {err}"
+
+    if kind == "CREATE_NOTE":
+        text = payload.get("text", "").strip()
+        if not text:
+            return "⚠️ Was soll die Notiz sein?"
+        ok, err = add_note(text)
+        return f"📝 Notiz in Notion gespeichert: {text}" if ok else f"⚠️ Konnte die Notiz nicht speichern: {err}"
+
+    if kind == "CREATE_REMINDER":
+        text = payload.get("text", "").strip()
+        try:
+            when_dt = datetime.fromisoformat(payload["when"])
+        except Exception:
+            return "⚠️ Wann soll ich dich erinnern? z. B. 'morgen 17 Uhr'."
+        if when_dt.tzinfo is None:
+            when_dt = TZ.localize(when_dt)
+        if when_dt <= datetime.now(TZ):
+            return "⚠️ Diese Zeit liegt in der Vergangenheit."
+        rid = str(uuid.uuid4())
+        data = load_data()
+        data.setdefault("reminders", []).append({"id": rid, "text": text, "when": when_dt.isoformat()})
+        save_data(data)
+        schedule_reminder(context.job_queue, rid, text, when_dt)
+        return f"⏰ Erinnerung gesetzt: {when_dt.strftime('%a %d.%m. %H:%M')} Uhr – „{text}"
+
+    return None
+
+
+# ===== TÄGLICHE JOBS + TERMIN-ERINNERUNG =====
 async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     events = get_events(force=True)
     await context.bot.send_message(chat_id=OWNER_ID, text=format_events(events),
@@ -329,13 +424,11 @@ async def email_question(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def upcoming_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Alle 10 Min: erinnert ~REMINDER_LEAD_MIN vor einem Termin."""
     events = get_events(days=2, force=True)
     now = datetime.now(TZ)
     data = load_data()
     reminded = set(data.get("reminded", []))
     changed = False
-
     for e in events:
         if e["all_day"]:
             continue
@@ -353,7 +446,6 @@ async def upcoming_reminder(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=OWNER_ID, text=msg, parse_mode='Markdown')
             reminded.add(e["uid"])
             changed = True
-
     if changed:
         data["reminded"] = list(reminded)[-200:]
         save_data(data)
@@ -367,17 +459,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = """
 ✅ **Assistent aktiv!**
 
-Ich bin dein persönlicher Assistent – schreib mir einfach. 🤖
+Schreib mir einfach – ich erledige das für dich. 🤖
 
 Ich kann:
 🧠 Auf deine Nachrichten antworten (mit Claude)
-📅 Termine anzeigen & **neue Termine in deinen iPhone-Kalender eintragen**
-⏰ Dich ~1 Stunde vor einem Termin erinnern
-📧 Dich nach deinen wichtigsten Emails fragen
+📅 Termine anzeigen & in deinen iPhone-Kalender eintragen
+⏰ Dich vor Terminen erinnern & persönliche Erinnerungen setzen
+✅ Todos in Notion speichern
+📝 Notizen in Notion speichern
 
 **Beispiele:**
 „Trag mir morgen 18 Uhr Zahnarzt ein"
-„Was habe ich diese Woche?"
+„Todo: Rechnung an Kaster schicken"
+„Notiz: Idee für Fotobox-Angebot"
+„Erinnere mich morgen 17 Uhr an den Anruf"
 
 **Befehle:** /start /termine /emails /help
 """
@@ -420,11 +515,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     answer = ask_claude(user_text)
-    created = try_handle_create_event(answer)
-    if created is not None:
+    kind, payload = parse_directive(answer)
+    if kind is not None:
+        reply = execute_directive(kind, payload, context)
         if conversation and conversation[-1]["role"] == "assistant":
-            conversation[-1]["content"] = created
-        await update.message.reply_text(created, parse_mode='Markdown')
+            conversation[-1]["content"] = reply
+        await update.message.reply_text(reply, parse_mode='Markdown')
     else:
         await update.message.reply_text(answer)
 
@@ -436,15 +532,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = """
 📖 **Hilfe**
 
-Schreib mir einfach – ich antworte als dein Assistent (Claude). 🤖
-
-📅 **Termine eintragen:** z. B. „Trag mir Freitag 15 Uhr Friseur ein"
-📋 **Termine ansehen:** /termine (oder „Was habe ich morgen?")
-⏰ **Erinnerung:** Ich melde mich automatisch ~1 Stunde vor jedem Termin.
+Schreib mir einfach, ich erledige es:
+📅 „Trag mir Freitag 15 Uhr Friseur ein" → Kalender
+✅ „Todo: Angebot schreiben" → Notion
+📝 „Notiz: Idee XY" → Notion
+⏰ „Erinnere mich morgen 17 Uhr an den Anruf" → Nachricht zur Uhrzeit
+📋 /termine → deine Termine
 
 Automatisch:
-⏰ 08:00 – Frage nach Emails
-⏰ 09:00 – Termine des Tages
+⏰ ~1 Std vor jedem Termin
+⏰ 08:00 Email-Frage · 09:00 Termine des Tages
 
 **Befehle:** /termine /emails /help
 """
@@ -480,6 +577,25 @@ def keep_alive():
             print(f"Wachhalter-Ping fehlgeschlagen: {e}")
 
 
+def reschedule_saved_reminders(job_queue):
+    """Beim Start: gespeicherte Erinnerungen neu einplanen, abgelaufene entfernen."""
+    data = load_data()
+    now = datetime.now(TZ)
+    kept = []
+    for r in data.get("reminders", []):
+        try:
+            when_dt = datetime.fromisoformat(r["when"])
+            if when_dt.tzinfo is None:
+                when_dt = TZ.localize(when_dt)
+        except Exception:
+            continue
+        if when_dt > now:
+            schedule_reminder(job_queue, r["id"], r["text"], when_dt)
+            kept.append(r)
+    data["reminders"] = kept
+    save_data(data)
+
+
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
@@ -495,6 +611,8 @@ def main():
     app.job_queue.run_daily(email_question, time=time(8, 0, tzinfo=TZ))
     app.job_queue.run_daily(daily_reminder, time=time(9, 0, tzinfo=TZ))
     app.job_queue.run_repeating(upcoming_reminder, interval=600, first=30)
+
+    reschedule_saved_reminders(app.job_queue)
 
     print("✅ Bot läuft!")
     app.run_polling()
