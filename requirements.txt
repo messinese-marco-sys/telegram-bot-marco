@@ -4,3 +4,4 @@ icalendar==5.0.11
 requests==2.31.0
 pytz==2024.1
 anthropic>=0.40
+caldav>=1.3
