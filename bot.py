@@ -795,8 +795,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Ich konnte die Sprachnachricht leider nicht verstehen.")
         return
 
-    await update.message.reply_text(f"🗣 {text}")
-
     data = load_data()
     data.setdefault("emails", []).append({
         "text": text, "timestamp": datetime.now().isoformat()
@@ -805,11 +803,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply, use_md = compute_reply(text, context)
 
+    voice_sent = False
     ogg_out = f"/tmp/reply_{voice.file_unique_id}.ogg"
     if synthesize_speech(reply, ogg_out):
         try:
             with open(ogg_out, "rb") as f:
                 await update.message.reply_voice(voice=f)
+            voice_sent = True
         except Exception as e:
             print(f"Voice-Antwort fehlgeschlagen: {e}")
         finally:
@@ -818,10 +818,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    if use_md:
-        await update.message.reply_text(reply, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(reply)
+    # Text nur als Fallback, falls die Sprachausgabe nicht geklappt hat
+    if not voice_sent:
+        if use_md:
+            await update.message.reply_text(reply, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(reply)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
