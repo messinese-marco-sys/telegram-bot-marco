@@ -45,6 +45,7 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_NOTES_PAGE_ID = os.getenv("NOTION_NOTES_PAGE_ID")
 NOTION_TODO_PAGE_ID = os.getenv("NOTION_TODO_PAGE_ID")
 NOTION_REMINDERS_PAGE_ID = os.getenv("NOTION_REMINDERS_PAGE_ID")
+NOTION_MAILS_PAGE_ID = os.getenv("NOTION_MAILS_PAGE_ID")
 NOTION_VERSION = "2022-06-28"
 
 # Erinnerung: wie viele Minuten vor einem Termin
@@ -389,6 +390,34 @@ def notion_list_notes(limit=5):
     return out[-limit:]
 
 
+def notion_list_mails(limit=15):
+    """Letzte Mail-Einträge (Text) von der Mail-Übersichts-Seite.
+    Make schreibt jede sortierte Mail als Zeile dort hinein."""
+    out = []
+    for blk in _notion_get_children(NOTION_MAILS_PAGE_ID):
+        t = blk.get("type")
+        if t not in ("bulleted_list_item", "numbered_list_item", "paragraph"):
+            continue
+        text = _plain_text(blk.get(t, {}).get("rich_text", [])).strip()
+        if text:
+            out.append(text)
+    return out[-limit:]
+
+
+def build_mail_overview():
+    """Übersicht der zuletzt sortierten Mails (aus der Notion-Mail-Seite)."""
+    if not (NOTION_TOKEN and NOTION_MAILS_PAGE_ID):
+        return ("📧 Die Mail-Übersicht ist noch nicht eingerichtet. "
+                "Sobald die Notion-Mail-Seite verbunden ist, zeige ich dir hier deine sortierten Mails.")
+    mails = notion_list_mails(limit=15)
+    if not mails:
+        return "📧 Aktuell keine sortierten Mails in der Übersicht."
+    lines = ["📧 **Deine zuletzt sortierten Mails:**", ""]
+    for m in mails:
+        lines.append(f"• {m}")
+    return "\n".join(lines)
+
+
 # ===== PERSÖNLICHE ERINNERUNGEN =====
 async def send_custom_reminder(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
@@ -443,6 +472,8 @@ def ask_claude(user_text):
         "CREATE_REMINDER {\"text\": \"...\", \"when\": \"YYYY-MM-DDTHH:MM\"}\n"
         "- Tagesüberblick (z. B. 'was steht heute an?', 'was habe ich morgen?'): "
         "DAY_OVERVIEW {\"date\": \"YYYY-MM-DD\"}  (date optional, ohne date = heute)\n"
+        "- Mail-Übersicht (z. B. 'was habe ich für Mails?', 'zeig mir meine Mails', 'was ist mit meinen Emails?'): "
+        "MAIL_OVERVIEW {}\n"
         "Zeiten sind Lokalzeit (Berlin). Löse 'heute', 'morgen', Wochentage anhand des aktuellen Datums auf. "
         "Unterschied: CREATE_EVENT ist ein Kalendertermin, CREATE_REMINDER ist nur eine Nachricht zur Uhrzeit. "
         "Wenn Infos fehlen (Uhrzeit/Titel), frage stattdessen kurz nach. "
@@ -530,7 +561,7 @@ def build_day_overview(date_str=None):
 
 
 def parse_directive(answer_text):
-    for key in ("CREATE_EVENT", "CREATE_TODO", "CREATE_NOTE", "CREATE_REMINDER", "DAY_OVERVIEW"):
+    for key in ("CREATE_EVENT", "CREATE_TODO", "CREATE_NOTE", "CREATE_REMINDER", "DAY_OVERVIEW", "MAIL_OVERVIEW"):
         m = re.search(key + r"\s*(\{.*\})", answer_text, re.DOTALL)
         if m:
             try:
@@ -593,6 +624,9 @@ def execute_directive(kind, payload, context):
 
     if kind == "DAY_OVERVIEW":
         return build_day_overview(payload.get("date"))
+
+    if kind == "MAIL_OVERVIEW":
+        return build_mail_overview()
 
     return None
 
@@ -657,7 +691,7 @@ async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def email_question(context: ContextTypes.DEFAULT_TYPE):
-    message = "📧 **Guten Morgen!**\n\nSchreib mir deine wichtigsten Emails von gestern/heute, dann fasse ich sie zusammen."
+    message = "📧 **Guten Morgen!** Hier deine sortierten Mails:\n\n" + build_mail_overview()
     await context.bot.send_message(chat_id=OWNER_ID, text=message, parse_mode='Markdown')
 
 
@@ -730,14 +764,7 @@ async def emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Zugriff verweigert!")
         return
-    data = load_data()
-    if data.get("emails"):
-        message = "📧 **Gespeicherte Nachrichten:**\n\n"
-        for i, email in enumerate(data["emails"][-10:], 1):
-            message += f"{i}. {email['text']}\n"
-    else:
-        message = "📧 Noch keine Nachrichten gespeichert."
-    await update.message.reply_text(message, parse_mode='Markdown')
+    await update.message.reply_text(build_mail_overview(), parse_mode='Markdown')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,7 +957,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.job_queue.run_daily(email_question, time=time(8, 0, tzinfo=TZ))
+    app.job_queue.run_daily(email_question, time=time(8, 20, tzinfo=TZ))
     app.job_queue.run_daily(daily_reminder, time=time(9, 0, tzinfo=TZ))
     app.job_queue.run_repeating(upcoming_reminder, interval=600, first=30)
 
